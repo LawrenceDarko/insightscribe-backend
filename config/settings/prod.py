@@ -2,7 +2,7 @@
 InsightScribe - Production Settings
 """
 
-from decouple import config
+from decouple import Csv, config
 
 from .base import *  # noqa: F401, F403
 
@@ -51,4 +51,14 @@ CACHES = {
 # ============================================
 LOGGING["root"]["level"] = "WARNING"  # noqa: F405
 LOGGING["loggers"]["apps"]["level"] = "INFO"  # noqa: F405
-LOGGING["handlers"]["file"]["filename"] = "/var/log/insightscribe/app.log"  # noqa: F405
+
+# Prefer stdout logging on Railway-style ephemeral filesystems.
+if config("ENABLE_FILE_LOGGING", default=False, cast=bool):
+    LOGGING["handlers"]["file"]["filename"] = config(  # noqa: F405
+        "FILE_LOG_PATH",
+        default="/tmp/insightscribe.log",
+    )
+else:
+    LOGGING["root"]["handlers"] = ["console"]  # noqa: F405
+    LOGGING["loggers"]["django.request"]["handlers"] = ["console"]  # noqa: F405
+    LOGGING["loggers"]["apps"]["handlers"] = ["console"]  # noqa: F405
