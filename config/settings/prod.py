@@ -2,6 +2,8 @@
 InsightScribe - Production Settings
 """
 
+import os
+
 from decouple import Csv, config
 
 from .base import *  # noqa: F401, F403
@@ -28,7 +30,18 @@ SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 # ============================================
 # ALLOWED HOSTS
 # ============================================
-ALLOWED_HOSTS = config("DJANGO_ALLOWED_HOSTS", cast=Csv())  # noqa: F405
+configured_hosts = config("DJANGO_ALLOWED_HOSTS", default="", cast=Csv())
+ALLOWED_HOSTS = [host for host in configured_hosts if host]
+
+# Railway deployments can rotate generated subdomains between releases.
+ALLOWED_HOSTS.append(".up.railway.app")
+
+railway_public_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+if railway_public_domain:
+    ALLOWED_HOSTS.append(railway_public_domain)
+
+# Keep order stable while removing duplicates.
+ALLOWED_HOSTS = list(dict.fromkeys(ALLOWED_HOSTS))
 
 # ============================================
 # DATABASE (production pool settings)
