@@ -5,16 +5,24 @@ Automatically triggers async transcription after a successful upload.
 """
 
 import logging
+import os
+from hashlib import sha256
+from urllib.parse import parse_qs, urlparse
 
+import tiktoken
 from django.db import transaction
 from django.utils import timezone
 
 from apps.common.validators import compute_file_hash, validate_audio_file, validate_file_not_duplicate
+from apps.transcription.models import TranscriptChunk
 
 from ..models import Interview, ProcessingStatus, VALID_STATUS_TRANSITIONS
 from .storage_service import generate_file_key, upload_file
 
 logger = logging.getLogger("apps.interviews")
+
+MAX_MANUAL_CHUNK_TOKENS = 500
+MANUAL_CHUNK_OVERLAP_TOKENS = 50
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +63,7 @@ def upload_interview(project, file, title="") -> tuple:
     interview = Interview.objects.create(
         project=project,
         title=title or file.name,
+        source_type="file",
         file_url=file_url,
         file_name=file.name,
         file_size=file.size,
@@ -74,6 +83,93 @@ def upload_interview(project, file, title="") -> tuple:
         logger.info("Transcription task dispatched for interview %s", interview.id)
     except Exception as exc:
         logger.error("Failed to dispatch transcription task for %s: %s", interview.id, exc)
+
+    return interview, None
+
+
+def create_interview_from_link(project, media_url: str, title: str = "") -> tuple:
+    """
+    Register an interview backed by a directly downloadable audio/video URL.
+    The regular async transcription pipeline is triggered immediately.
+    """
+    parsed = urlparse(media_url)
+    inferred_name = _infer_media_filename(parsed) or "external-media.mp4"
+
+    if Interview.objects.filter(project=project, file_url=media_url, is_deleted=False).exists():
+        return None, "This media link has already been uploaded to this project."
+
+    interview = Interview.objects.create(
+        project=project,
+        title=title or inferred_name,
+        source_type="link",
+        file_url=media_url,
+        file_name=inferred_name,
+        file_size=0,
+        file_hash="",
+        processing_status=ProcessingStatus.UPLOADED,
+    )
+
+    try:
+        from apps.transcription.tasks import transcribe_interview_task
+        transcribe_interview_task.delay(str(interview.id))
+        logger.info("Transcription task dispatched for link interview %s", interview.id)
+    except Exception as exc:
+        logger.error("Failed to dispatch transcription task for %s: %s", interview.id, exc)
+
+    return interview, None
+
+
+def create_interview_from_transcript(project, transcript_text: str, title: str = "") -> tuple:
+    """
+    Create an interview from manual transcript text, chunk it, then queue embeddings.
+    """
+    cleaned = (transcript_text or "").strip()
+    if not cleaned:
+        return None, "Transcript text cannot be empty."
+
+    text_hash = sha256(cleaned.encode("utf-8")).hexdigest()
+    if Interview.objects.filter(project=project, file_hash=text_hash, is_deleted=False).exists():
+        return None, "This transcript appears to be a duplicate of an existing interview."
+
+    chunks = _split_manual_transcript(cleaned)
+    if not chunks:
+        return None, "Transcript text did not contain any processable content."
+
+    with transaction.atomic():
+        interview = Interview.objects.create(
+            project=project,
+            title=title or "Manual transcript",
+            source_type="transcript",
+            file_url="",
+            file_name="manual-transcript.txt",
+            file_size=len(cleaned.encode("utf-8")),
+            file_hash=text_hash,
+            processing_status=ProcessingStatus.EMBEDDING,
+            processing_progress=0,
+            duration_seconds=0,
+        )
+
+        TranscriptChunk.objects.bulk_create(
+            [
+                TranscriptChunk(
+                    interview=interview,
+                    text=chunk["text"],
+                    start_time=0.0,
+                    end_time=0.0,
+                    chunk_index=idx,
+                    speaker_label="",
+                    token_count=chunk["token_count"],
+                )
+                for idx, chunk in enumerate(chunks)
+            ]
+        )
+
+    try:
+        from apps.embeddings.tasks import generate_embeddings_task
+        generate_embeddings_task.delay(str(interview.id))
+        logger.info("Embedding task dispatched for transcript interview %s", interview.id)
+    except Exception as exc:
+        logger.error("Failed to dispatch embedding task for %s: %s", interview.id, exc)
 
     return interview, None
 
@@ -176,3 +272,41 @@ def mark_for_reprocessing(interview) -> tuple[bool, str | None]:
     ])
     logger.info("Interview %s marked for reprocessing", interview.id)
     return True, None
+
+
+def _split_manual_transcript(text: str) -> list[dict]:
+    """Split transcript text into token-bounded chunks for embedding safety."""
+    encoder = tiktoken.encoding_for_model("gpt-4o")
+    tokens = encoder.encode(text)
+    if not tokens:
+        return []
+
+    chunks = []
+    idx = 0
+    step = max(MAX_MANUAL_CHUNK_TOKENS - MANUAL_CHUNK_OVERLAP_TOKENS, 1)
+
+    while idx < len(tokens):
+        window = tokens[idx: idx + MAX_MANUAL_CHUNK_TOKENS]
+        chunk_text = encoder.decode(window).strip()
+        if chunk_text:
+            chunks.append({"text": chunk_text, "token_count": len(window)})
+        idx += step
+
+    return chunks
+
+
+def _infer_media_filename(parsed_url) -> str:
+    """Try to infer a file-like name from URL path or common query params."""
+    from_path = os.path.basename(parsed_url.path)
+    if from_path and "." in from_path:
+        return from_path
+
+    query = parse_qs(parsed_url.query)
+    for key in ("filename", "file", "name"):
+        values = query.get(key, [])
+        if values:
+            candidate = values[0].strip()
+            if candidate and "." in candidate:
+                return candidate
+
+    return ""

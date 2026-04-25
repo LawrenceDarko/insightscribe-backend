@@ -38,6 +38,11 @@ INSIGHT_LLM_MAX_RETRIES: int = getattr(settings, "INSIGHT_LLM_MAX_RETRIES", 3)
 INSIGHT_LLM_RETRY_BASE_DELAY: float = getattr(settings, "INSIGHT_LLM_RETRY_BASE_DELAY", 2.0)
 INSIGHT_CLUSTER_TOP_K: int = getattr(settings, "INSIGHT_CLUSTER_TOP_K", 30)
 INSIGHT_CLUSTER_THRESHOLD: float = getattr(settings, "INSIGHT_CLUSTER_THRESHOLD", 0.30)
+INSIGHT_FULL_PER_INTERVIEW_TOKEN_CAP: int = getattr(
+    settings,
+    "INSIGHT_FULL_PER_INTERVIEW_TOKEN_CAP",
+    180,
+)
 
 _RETRIABLE = (APIConnectionError, APITimeoutError, RateLimitError)
 
@@ -121,6 +126,7 @@ REPORT_CONFIGS = {
         "title": "Full Insight Report",
         "instruction": (
             "Analyze the following interview transcript excerpts comprehensively. "
+            "Synthesize findings across all interviews represented in the excerpts, not just one conversation. "
             "Identify: (1) Top feature requests, (2) Common frustrations, (3) Positive themes, "
             "(4) Negative themes, (5) Onboarding issues. Rank each category by frequency."
         ),
@@ -201,25 +207,38 @@ def generate_report(project, user, report_type: str) -> tuple:
     if chunk_count == 0:
         return None, "No transcript data available. Upload and transcribe interviews first."
 
-    # ── 2. Gather chunks via semantic clustering ───────────────────────────
+    # ── 2. Gather chunks ───────────────────────────────────────────────────
     try:
-        relevant_chunks = _gather_relevant_chunks(project, config["seed_queries"])
+        if report_type == ReportType.FULL:
+            # For summary-style full reports, ensure broad project coverage.
+            relevant_chunks = _gather_balanced_project_chunks(project)
+        else:
+            relevant_chunks = _gather_relevant_chunks(project, config["seed_queries"])
     except Exception as exc:
         logger.error("Chunk gathering failed: %s", exc)
         return None, "Failed to gather transcript data for analysis."
 
     if not relevant_chunks:
-        # Fall back to chronological sampling when no embeddings exist
+        # Fall back to chronological sampling when embeddings are unavailable
+        # or when balanced retrieval yielded no rows.
         relevant_chunks = _fallback_chronological_chunks(project)
 
     if not relevant_chunks:
         return None, "No processable transcript data found."
 
+    if report_type != ReportType.FULL:
+        # Keep thematic reports grounded in the full project by ensuring a
+        # single interview cannot dominate the selected evidence.
+        relevant_chunks = _balance_chunks_across_interviews(relevant_chunks)
+
     # ── 3. Aggregate statistics ────────────────────────────────────────────
     stats = _compute_chunk_statistics(project)
 
     # ── 4. Build LLM context (token-budgeted) ─────────────────────────────
-    context, chunks_used = _build_report_context(relevant_chunks)
+    context, chunks_used = _build_report_context(
+        relevant_chunks,
+        interleave_by_interview=(report_type == ReportType.FULL),
+    )
 
     # ── 5. Generate via LLM ───────────────────────────────────────────────
     report_content = _generate_with_llm(config["instruction"], context)
@@ -379,6 +398,112 @@ def _fallback_chronological_chunks(project) -> list[dict]:
     ]
 
 
+def _balance_chunks_across_interviews(chunks: list[dict]) -> list[dict]:
+    """
+    Limit how many chunks any single interview can contribute.
+
+    This preserves the most relevant evidence while preventing reports from
+    becoming over-focused on the newest interview when it happens to match the
+    seed queries strongly.
+    """
+    if not chunks:
+        return []
+
+    interview_ids = [c.get("interview_id") for c in chunks if c.get("interview_id")]
+    unique_interview_count = len(set(interview_ids))
+    if unique_interview_count <= 1:
+        return chunks
+
+    per_interview_cap = max(1, INSIGHT_MAX_CHUNKS // unique_interview_count)
+    kept: list[dict] = []
+    counts: dict[str, int] = defaultdict(int)
+
+    for chunk in chunks:
+        interview_id = chunk.get("interview_id")
+        if not interview_id:
+            kept.append(chunk)
+            continue
+
+        if counts[interview_id] >= per_interview_cap:
+            continue
+
+        kept.append(chunk)
+        counts[interview_id] += 1
+
+    return kept or chunks
+
+
+def _gather_balanced_project_chunks(project) -> list[dict]:
+    """
+    Gather chunks for full summaries with broad interview coverage.
+
+    Strategy:
+    1. Split budget across interviews (round-robin by interview)
+    2. Pull chronological chunks per interview up to per-interview cap
+    3. Top up remaining budget chronologically across project
+    """
+    base_qs = (
+        TranscriptChunk.objects.filter(
+            interview__project=project,
+            interview__is_deleted=False,
+            is_deleted=False,
+        )
+        .select_related("interview")
+        .order_by("interview_id", "chunk_index")
+    )
+
+    interview_ids = list(base_qs.values_list("interview_id", flat=True).distinct())
+    if not interview_ids:
+        return []
+
+    per_interview_cap = max(1, INSIGHT_MAX_CHUNKS // len(interview_ids))
+    selected_chunks: list[dict] = []
+    selected_ids = set()
+
+    for interview_id in interview_ids:
+        interview_chunks = base_qs.filter(interview_id=interview_id)[:per_interview_cap]
+        for chunk in interview_chunks:
+            selected_ids.add(chunk.id)
+            selected_chunks.append({
+                "chunk_id": str(chunk.id),
+                "interview_id": str(chunk.interview_id),
+                "interview_title": chunk.interview.title,
+                "text": chunk.text,
+                "start_time": chunk.start_time,
+                "end_time": chunk.end_time,
+                "speaker_label": chunk.speaker_label or "",
+                "sentiment_score": chunk.sentiment_score,
+                "chunk_index": chunk.chunk_index,
+                "token_count": chunk.token_count or 0,
+                "similarity": None,
+            })
+
+        if len(selected_chunks) >= INSIGHT_MAX_CHUNKS:
+            return selected_chunks[:INSIGHT_MAX_CHUNKS]
+
+    remaining = INSIGHT_MAX_CHUNKS - len(selected_chunks)
+    if remaining > 0:
+        extra_chunks = base_qs.exclude(id__in=selected_ids)[:remaining]
+        selected_chunks.extend([
+            {
+                "chunk_id": str(chunk.id),
+                "interview_id": str(chunk.interview_id),
+                "interview_title": chunk.interview.title,
+                "text": chunk.text,
+                "start_time": chunk.start_time,
+                "end_time": chunk.end_time,
+                "speaker_label": chunk.speaker_label or "",
+                "sentiment_score": chunk.sentiment_score,
+                "chunk_index": chunk.chunk_index,
+                "token_count": chunk.token_count or 0,
+                "similarity": None,
+            }
+            for chunk in extra_chunks
+        ])
+
+    return selected_chunks
+
+
 # ============================================================================
 # Internal: Statistics aggregation
 # ============================================================================
@@ -418,19 +543,51 @@ def _compute_chunk_statistics(project) -> dict:
 # Internal: Context construction (token-budgeted)
 # ============================================================================
 
-def _build_report_context(chunks: list[dict]) -> tuple[str, list[dict]]:
+def _build_report_context(
+    chunks: list[dict],
+    *,
+    interleave_by_interview: bool = False,
+) -> tuple[str, list[dict]]:
     """
     Build a context string from chunks while staying within the configured
     token budget.  Returns ``(context_string, list_of_included_chunks)``.
     """
+    ordered_chunks = _interleave_chunks_by_interview(chunks) if interleave_by_interview else chunks
+    unique_interview_count = len({c.get("interview_id") for c in chunks if c.get("interview_id")})
+    full_report_token_cap = _compute_full_report_token_cap(unique_interview_count)
+
     parts: list[str] = []
     included: list[dict] = []
+    included_interviews: set[str] = set()
     token_count = 0
 
-    for c in chunks:
-        chunk_tokens = c.get("token_count", 0) or len(c["text"].split())
+    for c in ordered_chunks:
+        raw_text = c.get("text", "")
+        chunk_tokens = c.get("token_count", 0) or len(raw_text.split())
+        text = raw_text
+
+        # For full reports, trim long chunks so one interview cannot consume
+        # most of the prompt budget.
+        if interleave_by_interview and chunk_tokens > full_report_token_cap:
+            text = _truncate_text_by_token_approx(raw_text, full_report_token_cap)
+            chunk_tokens = full_report_token_cap
+
         if token_count + chunk_tokens > INSIGHT_MAX_CONTEXT_TOKENS and included:
-            break  # always include at least one chunk
+            # If this interview has not been represented yet, force a very small
+            # snippet so the final summary reflects broader project coverage.
+            interview_id = c.get("interview_id")
+            remaining = INSIGHT_MAX_CONTEXT_TOKENS - token_count
+            if (
+                interleave_by_interview
+                and interview_id
+                and interview_id not in included_interviews
+                and remaining >= 40
+            ):
+                forced_tokens = min(60, remaining)
+                text = _truncate_text_by_token_approx(raw_text, forced_tokens)
+                chunk_tokens = forced_tokens
+            else:
+                break  # always include at least one chunk
 
         sentiment_str = (
             f", Sentiment: {c['sentiment_score']:.2f}"
@@ -445,13 +602,64 @@ def _build_report_context(chunks: list[dict]) -> tuple[str, list[dict]]:
             f"[Interview: {c['interview_title']}, "
             f"Time: {start:.1f}s–{end:.1f}s"
             f"{speaker_str}{sentiment_str}]\n"
-            f"{c['text']}"
+            f"{text}"
         )
         parts.append(part)
-        included.append(c)
+        included_chunk = dict(c)
+        included_chunk["text"] = text
+        included_chunk["token_count"] = chunk_tokens
+        included.append(included_chunk)
+        if c.get("interview_id"):
+            included_interviews.add(c["interview_id"])
         token_count += chunk_tokens
 
     return "\n\n---\n\n".join(parts), included
+
+
+def _compute_full_report_token_cap(unique_interview_count: int) -> int:
+    """Compute a per-interview token cap for full reports."""
+    if unique_interview_count <= 0:
+        return INSIGHT_FULL_PER_INTERVIEW_TOKEN_CAP
+
+    dynamic_cap = INSIGHT_MAX_CONTEXT_TOKENS // unique_interview_count
+    return max(80, min(INSIGHT_FULL_PER_INTERVIEW_TOKEN_CAP, dynamic_cap))
+
+
+def _truncate_text_by_token_approx(text: str, token_cap: int) -> str:
+    """Approximate token truncation using whitespace-separated words."""
+    if token_cap <= 0 or not text:
+        return ""
+
+    words = text.split()
+    if len(words) <= token_cap:
+        return text
+
+    return " ".join(words[:token_cap]) + " …"
+
+
+def _interleave_chunks_by_interview(chunks: list[dict]) -> list[dict]:
+    """Round-robin chunks across interviews to improve coverage in token-limited prompts."""
+    by_interview: dict[str, list[dict]] = defaultdict(list)
+    interview_order: list[str] = []
+
+    for chunk in chunks:
+        interview_id = chunk.get("interview_id", "")
+        if interview_id not in by_interview:
+            interview_order.append(interview_id)
+        by_interview[interview_id].append(chunk)
+
+    interleaved: list[dict] = []
+    while True:
+        progressed = False
+        for interview_id in interview_order:
+            items = by_interview.get(interview_id)
+            if items:
+                interleaved.append(items.pop(0))
+                progressed = True
+        if not progressed:
+            break
+
+    return interleaved
 
 
 # ============================================================================

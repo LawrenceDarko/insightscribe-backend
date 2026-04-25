@@ -6,7 +6,7 @@ Authenticated endpoints for uploading, listing, retrieving, and managing intervi
 import logging
 
 from rest_framework.decorators import api_view, parser_classes, permission_classes
-from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 
 from apps.common.responses import created_response, error_response, not_found_response, success_response
@@ -14,6 +14,8 @@ from apps.projects.services.project_service import get_project_for_user
 
 from .serializers import InterviewListQuerySerializer, InterviewSerializer, InterviewUploadSerializer
 from .services.upload_service import (
+    create_interview_from_link,
+    create_interview_from_transcript,
     get_interview,
     get_project_interviews,
     mark_for_reprocessing,
@@ -29,7 +31,7 @@ logger = logging.getLogger("apps.interviews")
 # ---------------------------------------------------------------------------
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
-@parser_classes([MultiPartParser, FormParser])
+@parser_classes([MultiPartParser, FormParser, JSONParser])
 def interview_list_create_view(request, project_id):
     """List interviews or upload a new one for a project."""
     project = get_project_for_user(project_id, request.user)
@@ -68,7 +70,7 @@ def _list_interviews(request, project):
 
 
 def _upload_interview(request, project):
-    """Handle POST: validate and upload a new interview file."""
+    """Handle POST: validate and upload a new interview from file, text, or link."""
     serializer = InterviewUploadSerializer(data=request.data)
     if not serializer.is_valid():
         return error_response(
@@ -77,11 +79,28 @@ def _upload_interview(request, project):
             details=serializer.errors,
         )
 
-    interview, err = upload_interview(
-        project=project,
-        file=serializer.validated_data["file"],
-        title=serializer.validated_data.get("title", ""),
-    )
+    data = serializer.validated_data
+    title = data.get("title", "")
+
+    if data.get("file"):
+        interview, err = upload_interview(
+            project=project,
+            file=data["file"],
+            title=title,
+        )
+    elif data.get("transcript_text"):
+        interview, err = create_interview_from_transcript(
+            project=project,
+            transcript_text=data["transcript_text"],
+            title=title,
+        )
+    else:
+        interview, err = create_interview_from_link(
+            project=project,
+            media_url=data["media_url"],
+            title=title,
+        )
+
     if err:
         return error_response(message=err, code="UPLOAD_ERROR")
 

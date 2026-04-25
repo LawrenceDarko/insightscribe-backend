@@ -20,7 +20,7 @@ class InterviewSerializer(serializers.ModelSerializer):
     class Meta:
         model = Interview
         fields = [
-            "id", "project_id", "title", "file_url", "file_name", "file_size",
+            "id", "project_id", "title", "source_type", "file_url", "file_name", "file_size",
             "file_hash", "duration_seconds",
             "processing_status", "processing_progress", "processing_error",
             "processing_started_at", "processing_completed_at",
@@ -34,7 +34,27 @@ class InterviewUploadSerializer(serializers.Serializer):
     """Validate the multipart upload payload before hitting the service layer."""
 
     title = serializers.CharField(max_length=255, required=False, default="")
-    file = serializers.FileField()
+    file = serializers.FileField(required=False)
+    transcript_text = serializers.CharField(required=False, allow_blank=False)
+    media_url = serializers.URLField(required=False)
+
+    def validate(self, attrs):
+        """Require exactly one input mode: file, transcript_text, or media_url."""
+        has_file = bool(attrs.get("file"))
+        has_transcript = bool(attrs.get("transcript_text", "").strip())
+        has_media_url = bool(attrs.get("media_url"))
+
+        selected_modes = sum([has_file, has_transcript, has_media_url])
+        if selected_modes == 0:
+            raise serializers.ValidationError(
+                "Provide one of: file, transcript_text, or media_url."
+            )
+        if selected_modes > 1:
+            raise serializers.ValidationError(
+                "Provide only one upload input at a time."
+            )
+
+        return attrs
 
     def validate_file(self, file):
         """Quick client-facing checks (detailed validation is in the service layer)."""

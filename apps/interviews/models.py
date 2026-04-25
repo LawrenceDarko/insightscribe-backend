@@ -15,6 +15,12 @@ class ProcessingStatus(models.TextChoices):
     FAILED = "failed", "Failed"
 
 
+class InterviewSourceType(models.TextChoices):
+    FILE = "file", "File Upload"
+    TRANSCRIPT = "transcript", "Manual Transcript"
+    LINK = "link", "Media Link"
+
+
 # Valid state transitions for processing pipeline
 VALID_STATUS_TRANSITIONS = {
     ProcessingStatus.UPLOADED: [ProcessingStatus.TRANSCRIBING, ProcessingStatus.FAILED],
@@ -35,7 +41,13 @@ class Interview(BaseModel):
         db_index=True,
     )
     title = models.CharField(max_length=255, blank=True, default="")
-    file_url = models.URLField(max_length=2048)
+    source_type = models.CharField(
+        max_length=20,
+        choices=InterviewSourceType.choices,
+        default=InterviewSourceType.FILE,
+        db_index=True,
+    )
+    file_url = models.URLField(max_length=2048, blank=True, default="")
     file_name = models.CharField(max_length=512, default="")
     file_size = models.BigIntegerField(
         default=0,

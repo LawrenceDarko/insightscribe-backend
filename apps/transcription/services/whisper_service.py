@@ -11,6 +11,7 @@ import logging
 import tempfile
 import time
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import tiktoken
 from django.conf import settings
@@ -39,6 +40,20 @@ WHISPER_RETRY_BASE_DELAY: float = getattr(settings, "WHISPER_RETRY_BASE_DELAY", 
 
 # Retriable OpenAI exceptions
 _RETRIABLE_EXCEPTIONS = (APIConnectionError, APITimeoutError, RateLimitError)
+
+_CONTENT_TYPE_EXTENSION_MAP = {
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/ogg": ".ogg",
+    "audio/webm": ".webm",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/quicktime": ".mov",
+}
 
 
 # ============================================================================
@@ -69,14 +84,14 @@ def transcribe_interview(interview) -> bool:
     try:
         # 2. Download audio from S3
         update_processing_progress(interview, 5)
-        audio_bytes = _download_from_s3(interview.file_url)
+        audio_bytes, inferred_ext = _download_audio_bytes(interview.file_url)
         if audio_bytes is None:
-            _fail(interview, "Failed to download audio from storage.")
+            _fail(interview, "Failed to download media from URL. Ensure it is a direct public audio/video file.")
             return False
         update_processing_progress(interview, 15)
 
         # 3. Whisper API
-        transcript_data = _call_whisper_with_retries(audio_bytes, interview.file_name)
+        transcript_data = _call_whisper_with_retries(audio_bytes, interview.file_name, inferred_ext)
         if transcript_data is None:
             _fail(interview, "Whisper API returned no data after retries.")
             return False
@@ -122,6 +137,16 @@ def transcribe_interview(interview) -> bool:
 # ============================================================================
 # S3 download
 # ============================================================================
+def _download_audio_bytes(file_url: str) -> tuple[bytes | None, str | None]:
+    """Download media bytes and infer extension from S3-managed URLs or direct links."""
+    endpoint_netloc = urlparse(settings.AWS_S3_ENDPOINT_URL).netloc
+    file_netloc = urlparse(file_url).netloc
+
+    if file_netloc and file_netloc == endpoint_netloc:
+        return _download_from_s3(file_url), None
+    return _download_from_external_url(file_url)
+
+
 def _download_from_s3(file_url: str) -> bytes | None:
     """
     Download the audio file from Supabase S3 storage into memory.
@@ -163,10 +188,43 @@ def _download_from_s3(file_url: str) -> bytes | None:
         return None
 
 
+def _download_from_external_url(file_url: str) -> tuple[bytes | None, str | None]:
+    """Download bytes from direct media URL and infer extension from response headers."""
+    max_bytes = getattr(settings, "MAX_UPLOAD_SIZE_BYTES", 200 * 1024 * 1024)
+    try:
+        req = Request(file_url, headers={"User-Agent": "InsightScribe-Transcriber/1.0"})
+        with urlopen(req, timeout=60) as resp:
+            content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            inferred_ext = _CONTENT_TYPE_EXTENSION_MAP.get(content_type)
+            if content_type and not inferred_ext:
+                logger.error("External URL is not a supported media type: %s (%s)", file_url, content_type)
+                return None, None
+
+            content_length = resp.headers.get("Content-Length")
+            if content_length and int(content_length) > max_bytes:
+                logger.error("External file exceeds max size: %s (%s bytes)", file_url, content_length)
+                return None, None
+
+            body = resp.read(max_bytes + 1)
+            if len(body) > max_bytes:
+                logger.error("External file exceeds max size while reading: %s", file_url)
+                return None, None
+
+            logger.info("Downloaded %.2f MB from external URL", len(body) / (1024 * 1024))
+            return body, inferred_ext
+    except Exception as exc:
+        logger.error("External download failed for %s: %s", file_url, exc)
+        return None, None
+
+
 # ============================================================================
 # Whisper API
 # ============================================================================
-def _call_whisper_with_retries(audio_bytes: bytes, file_name: str) -> dict | None:
+def _call_whisper_with_retries(
+    audio_bytes: bytes,
+    file_name: str,
+    inferred_extension: str | None = None,
+) -> dict | None:
     """
     Call Whisper with exponential-backoff retry for transient errors.
     Writes audio to a named temp file because OpenAI SDK requires a file-like
@@ -174,7 +232,7 @@ def _call_whisper_with_retries(audio_bytes: bytes, file_name: str) -> dict | Non
     """
     client = OpenAI(api_key=settings.OPENAI_API_KEY)
     # Determine a safe suffix for the temp file
-    suffix = _extract_extension(file_name) or ".mp3"
+    suffix = _extract_extension(file_name) or inferred_extension or ".mp3"
 
     for attempt in range(1, WHISPER_MAX_RETRIES + 1):
         try:
