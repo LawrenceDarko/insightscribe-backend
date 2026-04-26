@@ -14,6 +14,8 @@ DEBUG = True
 # ============================================
 ALLOWED_HOSTS = ["localhost", "127.0.0.1", "0.0.0.0", "insightscribe.vercel.app", "web-production-30908.up.railway.app"]
 
+CSRF_TRUSTED_ORIGINS = [ "https://insightscribe.vercel.app/", "https://web-production-30908.up.railway.app/" ]
+
 # ============================================
 # CORS (allow all in dev)
 # ============================================
