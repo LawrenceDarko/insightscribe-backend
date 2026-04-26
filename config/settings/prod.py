@@ -11,7 +11,7 @@ from .base import *  # noqa: F401, F403
 # ============================================
 # DEBUG
 # ============================================
-DEBUG = False
+DEBUG = True
 
 # ============================================
 # SECURITY
@@ -44,7 +44,7 @@ if railway_public_domain:
 # Keep order stable while removing duplicates.
 ALLOWED_HOSTS = list(dict.fromkeys(ALLOWED_HOSTS))
 CSRF_TRUSTED_ORIGINS = ["https://web-production-30908.up.railway.app"]
-CORS_ALLOWED_ORIGINS = ["https://insightscribe.vercel.app", "http://localhost:3000",]
+CORS_ALLOWED_ORIGINS = ["https://insightscribe.vercel.app"]
 # ============================================
 # DATABASE (production pool settings)
 # ============================================
