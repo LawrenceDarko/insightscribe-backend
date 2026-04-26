@@ -34,7 +34,7 @@ configured_hosts = config("DJANGO_ALLOWED_HOSTS", default="", cast=Csv())
 ALLOWED_HOSTS = [host for host in configured_hosts if host]
 
 # Railway deployments can rotate generated subdomains between releases.
-ALLOWED_HOSTS.append(".up.railway.app")
+ALLOWED_HOSTS.append("insightscribe.vercel.app")
 
 railway_public_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
 if railway_public_domain:

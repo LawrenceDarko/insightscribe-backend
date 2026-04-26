@@ -12,7 +12,7 @@ DEBUG = True
 # ============================================
 # ALLOWED HOSTS
 # ============================================
-ALLOWED_HOSTS = ["localhost", "127.0.0.1", "0.0.0.0"]
+ALLOWED_HOSTS = ["localhost", "127.0.0.1", "0.0.0.0", "insightscribe.vercel.app"]
 
 # ============================================
 # CORS (allow all in dev)
