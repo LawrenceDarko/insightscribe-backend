@@ -19,7 +19,8 @@ CSRF_TRUSTED_ORIGINS = ["https://web-production-30908.up.railway.app"]
 # ============================================
 # CORS (allow all in dev)
 # ============================================
-CORS_ALLOW_ALL_ORIGINS = True
+# CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOWED_ORIGINS = ["*"]
 
 # ============================================
 # REST FRAMEWORK (add browsable API in dev)
